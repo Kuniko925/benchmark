@@ -2,6 +2,8 @@ import os
 
 os.environ["USE_LIBUV"] = "0"
 os.environ["ACCELERATE_USE_GLOO"] = "1"
+os.environ["MASTER_ADDR"] = "127.0.0.1"
+os.environ.setdefault("MASTER_PORT", "29500")
 
 import threading
 import time
@@ -94,6 +96,7 @@ def main(arg) -> None:
         report_to="none",
         packing=False,
         dataloader_pin_memory=True,
+        ddp_backend="gloo",
     )
 
     trainer = SFTTrainer(model=model, args=training_config, train_dataset=dataset, processing_class=tokenizer, peft_config=lora_config,)
