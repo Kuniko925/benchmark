@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 import argparse
 import torch
+import torch.distributed as dist
 from datasets import load_dataset
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -18,6 +19,7 @@ from codecarbon import EmissionsTracker
 from gpulog import gpu_logger
 from cpulog import cpu_logger
 from flopslog import profile_forward_flops
+
 
 def format_alpaca(example: dict) -> str:
     instruction = example["instruction"].strip()
@@ -101,11 +103,19 @@ def main(arg) -> None:
 
     trainer = SFTTrainer(model=model, args=training_config, train_dataset=dataset, processing_class=tokenizer, peft_config=lora_config,)
 
-    profile_forward_flops(
-        model=trainer.model, tokenizer=tokenizer, output_path=args.flops_log_path, device=torch.device(f"cuda:0"), sequence_length=args.profile_sequence_length,
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    rank_flops_path = args.flops_log_path.with_name(
+        f"{args.flops_log_path.stem}_rank{rank}"
+        f"{args.flops_log_path.suffix}"
     )
 
-    stop_event = threading.Event()
+    profile_forward_flops(
+        model=trainer.model,
+        tokenizer=tokenizer,
+        output_path=rank_flops_path,
+        sequence_length=args.profile_sequence_length,
+    )
 
     stop_event = threading.Event()
     gpu_logger_threads = []

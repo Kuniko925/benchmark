@@ -3,13 +3,9 @@ import torch
 import time
 from flops_profiler.profiler import FlopsProfiler
 
-def profile_forward_flops(
-    model,
-    tokenizer,
-    output_path: Path,
-    device: torch.device,
-    sequence_length: int = 512,
-) -> dict:
+def profile_forward_flops(model, tokenizer, output_path: Path, sequence_length: int = 512,) -> dict:
+
+    device = next(model.parameters()).device
     sample_text = (
         "Below is an instruction that describes a task.\n\n"
         "### Instruction:\n"
@@ -17,13 +13,7 @@ def profile_forward_flops(
         "### Response:\n"
     )
 
-    encoded = tokenizer(
-        sample_text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=sequence_length,
-        padding="max_length",
-    )
+    encoded = tokenizer(sample_text, return_tensors="pt", truncation=True, max_length=sequence_length, padding="max_length",)
 
     inputs = {
         key: value.to(device)
@@ -40,7 +30,7 @@ def profile_forward_flops(
                 use_cache=False,
             )
 
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device)
 
     profiler = FlopsProfiler(model)
     profiler.start_profile()
@@ -54,7 +44,7 @@ def profile_forward_flops(
                 use_cache=False,
             )
 
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
 
         elapsed_sec = time.perf_counter() - start
 
