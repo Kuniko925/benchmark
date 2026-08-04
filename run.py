@@ -99,11 +99,27 @@ def main(arg) -> None:
 
     stop_event = threading.Event()
 
-    gpu_logger_thread = threading.Thread(
-        target=gpu_logger,
-        args=(stop_event, args.gpu_log_path, args.log_interval_sec,),
-        daemon=True,
-    )
+    stop_event = threading.Event()
+    gpu_logger_threads = []
+
+    for gpu_index in range(torch.cuda.device_count()):
+        gpu_log_path = args.gpu_log_path.with_name(
+            f"{args.gpu_log_path.stem}_gpu{gpu_index}"
+            f"{args.gpu_log_path.suffix}"
+        )
+
+        thread = threading.Thread(
+            target=gpu_logger,
+            args=(
+                stop_event,
+                gpu_log_path,
+                gpu_index,
+                args.log_interval_sec,
+            ),
+            daemon=True,
+        )
+
+        gpu_logger_threads.append(thread)
 
     cpu_logger_thread = threading.Thread(
         target=cpu_logger,
@@ -119,7 +135,9 @@ def main(arg) -> None:
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
 
-    gpu_logger_thread.start()
+    for thread in gpu_logger_threads:
+        thread.start()
+
     cpu_logger_thread.start()
     carbon_tracker.start()
     start = time.perf_counter()
@@ -131,7 +149,9 @@ def main(arg) -> None:
         torch.cuda.synchronize()
 
         stop_event.set()
-        gpu_logger_thread.join(timeout=10)
+
+        for thread in gpu_logger_threads:
+            thread.join(timeout=10)
         cpu_logger_thread.join(timeout=10)
 
     elapsed = time.perf_counter() - start
