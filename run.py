@@ -89,6 +89,7 @@ def main(arg) -> None:
         report_to="none",
         packing=False,
         dataloader_pin_memory=True,
+        use_libuv=False,
     )
 
     trainer = SFTTrainer(model=model, args=training_config, train_dataset=dataset, processing_class=tokenizer, peft_config=lora_config,)
