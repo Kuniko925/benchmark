@@ -1,3 +1,8 @@
+import os
+
+os.environ["USE_LIBUV"] = "0"
+os.environ["ACCELERATE_USE_GLOO"] = "1"
+
 import threading
 import time
 from pathlib import Path
