@@ -99,11 +99,14 @@ def main(arg) -> None:
         packing=False,
         dataloader_pin_memory=True,
         ddp_backend="gloo",
+        ddp_find_unused_parameters=False,
     )
 
     trainer = SFTTrainer(model=model, args=training_config, train_dataset=dataset, processing_class=tokenizer, peft_config=lora_config,)
 
-    rank = dist.get_rank() if dist.is_initialized() else 0
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    is_main_process = rank == 0
 
     rank_flops_path = args.flops_log_path.with_name(
         f"{args.flops_log_path.stem}_rank{rank}"
@@ -117,47 +120,47 @@ def main(arg) -> None:
         sequence_length=args.profile_sequence_length,
     )
 
+    if distributed:
+        dist.barrier()
+
     stop_event = threading.Event()
     gpu_logger_threads = []
+    cpu_logger_thread = None
+    carbon_tracker = None
 
-    for gpu_index in range(torch.cuda.device_count()):
-        gpu_log_path = args.gpu_log_path.with_name(
-            f"{args.gpu_log_path.stem}_gpu{gpu_index}"
-            f"{args.gpu_log_path.suffix}"
-        )
+    if is_main_process:
+        for gpu_index in range(torch.cuda.device_count()):
+            gpu_log_path = args.gpu_log_path.with_name(f"{args.gpu_log_path.stem}_gpu{gpu_index}{args.gpu_log_path.suffix}")
 
-        thread = threading.Thread(
-            target=gpu_logger,
-            args=(
-                stop_event,
-                gpu_log_path,
-                gpu_index,
-                args.log_interval_sec,
-            ),
+            thread = threading.Thread(
+                target=gpu_logger,
+                args=(stop_event, gpu_log_path, gpu_index, args.log_interval_sec,),
+                daemon=True,
+            )
+
+            gpu_logger_threads.append(thread)
+
+        cpu_logger_thread = threading.Thread(
+            target=cpu_logger,
+            args=(stop_event, args.cpu_log_path, args.log_interval_sec,),
             daemon=True,
         )
 
-        gpu_logger_threads.append(thread)
-
-    cpu_logger_thread = threading.Thread(
-        target=cpu_logger,
-        args=(stop_event, args.cpu_log_path, args.log_interval_sec,),
-        daemon=True,
-    )
-
-    carbon_tracker = EmissionsTracker(
-        log_level="error",
-        save_to_file=False,
-    )
+        carbon_tracker = EmissionsTracker(log_level="error", save_to_file=False,)
 
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
 
-    for thread in gpu_logger_threads:
-        thread.start()
+    if is_main_process:
+        for thread in gpu_logger_threads:
+            thread.start()
 
-    cpu_logger_thread.start()
-    carbon_tracker.start()
+        if cpu_logger_thread is not None:
+            cpu_logger_thread.start()
+
+        if carbon_tracker is not None:
+            carbon_tracker.start()
+
     start = time.perf_counter()
 
     try:
@@ -166,28 +169,38 @@ def main(arg) -> None:
     finally:
         torch.cuda.synchronize()
 
-        stop_event.set()
+        if is_main_process:
+            stop_event.set()
 
-        for thread in gpu_logger_threads:
-            thread.join(timeout=10)
-        cpu_logger_thread.join(timeout=10)
+            for thread in gpu_logger_threads:
+                thread.join(timeout=10)
 
-    elapsed = time.perf_counter() - start
-    emissions = carbon_tracker.stop()
-    energy_wh = carbon_tracker._total_energy.kWh * 1000
+            if cpu_logger_thread is not None:
+                cpu_logger_thread.join(timeout=10)
 
-    peak_vram_gib = (torch.cuda.max_memory_allocated() / 1024**3)
+    if is_main_process:
+        elapsed = time.perf_counter() - start
 
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+        emissions = carbon_tracker.stop()
+        energy_wh = carbon_tracker._total_energy.kWh * 1000
+        peak_vram_gib = (torch.cuda.max_memory_allocated() / 1024 ** 3)
 
-    print(f"Training time: {elapsed:.2f} sec")
-    print(f"Peak allocated VRAM: {peak_vram_gib:.2f} GiB")
-    print(f"LoRA adapter saved to: {args.output_dir.resolve()}")
-    print(f"GPU metrics saved to: {args.gpu_log_path.resolve()}")
-    print(f"CPU metrics saved to: {args.cpu_log_path.resolve()}")
-    print(f"Energy: {energy_wh:.4f} Wh")
-    print(f"CO2 emissions: {emissions * 1000:.4f} gCO2eq")
+        trainer.save_model(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+
+        print(f"Training time: {elapsed:.2f} sec")
+        print(f"Peak allocated VRAM: {peak_vram_gib:.2f} GiB")
+        print(f"LoRA adapter saved to: {args.output_dir.resolve()}")
+
+        for gpu_index in range(torch.cuda.device_count()):
+            gpu_log_path = args.gpu_log_path.with_name(
+                f"{args.gpu_log_path.stem}_gpu{gpu_index}{args.gpu_log_path.suffix}"
+            )
+            print(f"GPU {gpu_index} metrics saved to: {gpu_log_path.resolve()}")
+
+        print(f"CPU metrics saved to: {args.cpu_log_path.resolve()}")
+        print(f"Energy: {energy_wh:.4f} Wh")
+        print(f"CO2 emissions: {emissions * 1000:.4f} gCO2eq")
 
 if __name__ == "__main__":
 
