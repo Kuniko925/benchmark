@@ -69,7 +69,7 @@ def main(arg) -> None:
     model.enable_input_require_grads()
 
     dataset = load_dataset(args.dataset, split="train",)
-    dataset = dataset.select(range(min(1000, len(dataset))))
+    #dataset = dataset.select(range(min(1000, len(dataset))))
     dataset = dataset.map(lambda example: {"text": format_alpaca(example)},remove_columns=dataset.column_names,)
 
     lora_config = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM", target_modules=[
@@ -88,8 +88,8 @@ def main(arg) -> None:
         dataset_text_field="text",
         max_length=512,
         num_train_epochs=1,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=8,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
         learning_rate=2e-4,
         logging_steps=10,
         save_steps=100,
