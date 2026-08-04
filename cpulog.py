@@ -29,9 +29,6 @@ def find_cpu_sensor(cpu_data: dict, sensor_type: str, preferred_names: list[str]
     return None
 
 
-
-
-
 def average_cpu_sensor(cpu_data: dict, sensor_type: str, name_fragment: str,) -> float | None:
     values: list[float] = []
     fragment_lower = name_fragment.lower()
@@ -65,8 +62,8 @@ def cpu_logger(stop_event: threading.Event, csv_path: Path, interval_sec: float 
         initial_cpu_data = computer.cpu
 
         print("CPU monitoring started.")
-        print("Detected CPU sensor data:")
-        print(initial_cpu_data)
+        #print("Detected CPU sensor data:")
+        #print(initial_cpu_data)
 
         with csv_path.open(
             mode="w",

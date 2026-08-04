@@ -1,16 +1,8 @@
-import os
-
-os.environ["USE_LIBUV"] = "0"
-os.environ["ACCELERATE_USE_GLOO"] = "1"
-os.environ["MASTER_ADDR"] = "127.0.0.1"
-os.environ.setdefault("MASTER_PORT", "29500")
-
 import threading
 import time
 from pathlib import Path
 import argparse
 import torch
-import torch.distributed as dist
 from datasets import load_dataset
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -47,13 +39,23 @@ def main(arg) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("No CUDA GPU")
 
+    torch.cuda.set_device(0)
+
+    for gpu_index in range(torch.cuda.device_count()):
+        torch.empty(1, device=f"cuda:{gpu_index}")
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Detected {torch.cuda.device_count()} GPU(s)")
-    for i in range(torch.cuda.device_count()):
-        print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+
+    for gpu_index in range(torch.cuda.device_count()):
+        print(
+            f"GPU {gpu_index}: "
+            f"{torch.cuda.get_device_name(gpu_index)}"
+        )
+
+    print("Parallel mode: torch.nn.DataParallel")
     print("PyTorch:", torch.__version__)
-    print("GPU log:", args.gpu_log_path.resolve())
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
 
@@ -62,7 +64,7 @@ def main(arg) -> None:
 
     tokenizer.padding_side = "right"
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_id, torch_dtype=torch.bfloat16, use_cache=False,)
+    model = AutoModelForCausalLM.from_pretrained(args.model_id, dtype=torch.bfloat16, use_cache=False,)
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
 
@@ -98,68 +100,55 @@ def main(arg) -> None:
         report_to="none",
         packing=False,
         dataloader_pin_memory=True,
-        ddp_backend="gloo",
-        ddp_find_unused_parameters=False,
+        loss_type="nll",
     )
 
     trainer = SFTTrainer(model=model, args=training_config, train_dataset=dataset, processing_class=tokenizer, peft_config=lora_config,)
 
-    distributed = dist.is_available() and dist.is_initialized()
-    rank = dist.get_rank() if distributed else 0
-    is_main_process = rank == 0
-
-    rank_flops_path = args.flops_log_path.with_name(
-        f"{args.flops_log_path.stem}_rank{rank}"
-        f"{args.flops_log_path.suffix}"
-    )
-
     profile_forward_flops(
         model=trainer.model,
         tokenizer=tokenizer,
-        output_path=rank_flops_path,
+        output_path=args.flops_log_path,
         sequence_length=args.profile_sequence_length,
     )
 
-    if distributed:
-        dist.barrier()
+    print(f"Trainer GPU count: {trainer.args.n_gpu}")
+    print(f"Trainer parallel mode: {trainer.args.parallel_mode}")
+    print(f"Trainer train batch size: {trainer.args.train_batch_size}")
 
     stop_event = threading.Event()
     gpu_logger_threads = []
     cpu_logger_thread = None
     carbon_tracker = None
 
-    if is_main_process:
-        for gpu_index in range(torch.cuda.device_count()):
-            gpu_log_path = args.gpu_log_path.with_name(f"{args.gpu_log_path.stem}_gpu{gpu_index}{args.gpu_log_path.suffix}")
+    for gpu_index in range(torch.cuda.device_count()):
+        gpu_log_path = args.gpu_log_path.with_name(f"{args.gpu_log_path.stem}_gpu{gpu_index}{args.gpu_log_path.suffix}")
 
-            thread = threading.Thread(
-                target=gpu_logger,
-                args=(stop_event, gpu_log_path, gpu_index, args.log_interval_sec,),
-                daemon=True,
-            )
-
-            gpu_logger_threads.append(thread)
-
-        cpu_logger_thread = threading.Thread(
-            target=cpu_logger,
-            args=(stop_event, args.cpu_log_path, args.log_interval_sec,),
+        thread = threading.Thread(
+            target=gpu_logger,
+            args=(stop_event, gpu_log_path, gpu_index, args.log_interval_sec,),
             daemon=True,
         )
 
-        carbon_tracker = EmissionsTracker(log_level="error", save_to_file=False,)
+        gpu_logger_threads.append(thread)
+
+    cpu_logger_thread = threading.Thread(
+        target=cpu_logger,
+        args=(stop_event, args.cpu_log_path, args.log_interval_sec,),
+        daemon=True,
+    )
+
+    carbon_tracker = EmissionsTracker(log_level="error", save_to_file=False,)
 
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
 
-    if is_main_process:
-        for thread in gpu_logger_threads:
-            thread.start()
 
-        if cpu_logger_thread is not None:
-            cpu_logger_thread.start()
+    for thread in gpu_logger_threads:
+        thread.start()
 
-        if carbon_tracker is not None:
-            carbon_tracker.start()
+    cpu_logger_thread.start()
+    carbon_tracker.start()
 
     start = time.perf_counter()
 
@@ -169,38 +158,36 @@ def main(arg) -> None:
     finally:
         torch.cuda.synchronize()
 
-        if is_main_process:
-            stop_event.set()
+        stop_event.set()
 
-            for thread in gpu_logger_threads:
-                thread.join(timeout=10)
+        for thread in gpu_logger_threads:
+            thread.join(timeout=10)
 
-            if cpu_logger_thread is not None:
-                cpu_logger_thread.join(timeout=10)
+        cpu_logger_thread.join(timeout=10)
 
-    if is_main_process:
-        elapsed = time.perf_counter() - start
 
-        emissions = carbon_tracker.stop()
-        energy_wh = carbon_tracker._total_energy.kWh * 1000
-        peak_vram_gib = (torch.cuda.max_memory_allocated() / 1024 ** 3)
+    elapsed = time.perf_counter() - start
 
-        trainer.save_model(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
+    emissions = carbon_tracker.stop()
+    energy_wh = carbon_tracker._total_energy.kWh * 1000
+    peak_vram_gib = (torch.cuda.max_memory_allocated() / 1024 ** 3)
 
-        print(f"Training time: {elapsed:.2f} sec")
-        print(f"Peak allocated VRAM: {peak_vram_gib:.2f} GiB")
-        print(f"LoRA adapter saved to: {args.output_dir.resolve()}")
+    trainer.save_model(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
 
-        for gpu_index in range(torch.cuda.device_count()):
-            gpu_log_path = args.gpu_log_path.with_name(
-                f"{args.gpu_log_path.stem}_gpu{gpu_index}{args.gpu_log_path.suffix}"
-            )
-            print(f"GPU {gpu_index} metrics saved to: {gpu_log_path.resolve()}")
+    print(f"Training time: {elapsed:.2f} sec")
+    print(f"Peak allocated VRAM: {peak_vram_gib:.2f} GiB")
+    print(f"LoRA adapter saved to: {args.output_dir.resolve()}")
 
-        print(f"CPU metrics saved to: {args.cpu_log_path.resolve()}")
-        print(f"Energy: {energy_wh:.4f} Wh")
-        print(f"CO2 emissions: {emissions * 1000:.4f} gCO2eq")
+    for gpu_index in range(torch.cuda.device_count()):
+        gpu_log_path = args.gpu_log_path.with_name(
+            f"{args.gpu_log_path.stem}_gpu{gpu_index}{args.gpu_log_path.suffix}"
+        )
+        print(f"GPU {gpu_index} metrics saved to: {gpu_log_path.resolve()}")
+
+    print(f"CPU metrics saved to: {args.cpu_log_path.resolve()}")
+    print(f"Energy: {energy_wh:.4f} Wh")
+    print(f"CO2 emissions: {emissions * 1000:.4f} gCO2eq")
 
 if __name__ == "__main__":
 
