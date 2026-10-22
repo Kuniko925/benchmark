@@ -1,7 +1,9 @@
-"""Single-GPU video classification worker, currently implementing X-CLIP.
+"""Single-GPU video classification worker supporting X-CLIP, Vita-CLIP and EVL.
 
-Full-parameter fine-tuning with class-prompt cross entropy; not LLM LoRA or
-the official X-CLIP research training recipe. Run through run_vlm.py.
+X-CLIP uses full-parameter fine-tuning; Vita-CLIP uses frozen-backbone prompt
+learning; EVL trains a decoder on frozen image features. These benchmark loops
+do not reproduce the full paper training recipes.
+Launch through run_vlm.py --backend xclip|vita|evl to isolate GPUs and record telemetry.
 """
 import argparse
 import csv
@@ -100,7 +102,7 @@ def read_clip(path, num_frames):
     return [frames[index] for index in indices]
 
 
-def profile_forward(model, inputs, output_dir, output_path, precision):
+def profile_forward(model, inputs, output_dir, output_path, precision, class_count=None):
     import torch
     from flops_profiler.profiler import FlopsProfiler
 
@@ -122,8 +124,8 @@ def profile_forward(model, inputs, output_dir, output_path, precision):
             "forward_latency_sec": elapsed,
             "parameters": float(profiler.get_total_params(as_string=False)),
             "video_input_shape": list(inputs["pixel_values"].shape),
-            "class_prompt_count": inputs["input_ids"].shape[0],
-            "notice": "Forward only, one training batch and all class prompts; not training FLOPs",
+            "class_prompt_count": class_count if class_count is not None else inputs["input_ids"].shape[0],
+            "notice": "Forward only, one training batch and all output classes; not training FLOPs",
         }
         profile["estimated_forward_flops_per_sec"] = profile["forward_flops"] / elapsed
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,8 +142,9 @@ def profile_forward(model, inputs, output_dir, output_path, precision):
                 model.train(previous_state)
 
 
-def main():
+def parse_worker_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", choices=["xclip", "vita", "evl"], default="xclip")
     parser.add_argument("--model-id", required=True)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--video-csv", type=Path)
@@ -150,16 +153,27 @@ def main():
     parser.add_argument("--ucf101-split", type=int, choices=[1, 2, 3], default=1)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=4)
-    parser.add_argument("--max-steps", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--max-steps", type=int, default=-1)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging-steps", type=int, default=50)
     parser.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
     parser.add_argument("--profile-flops", action="store_true")
     parser.add_argument("--flops-log-path", type=Path)
-    args = parser.parse_args()
+    parser.add_argument("--vita-repo", type=Path, help="Official repository; required for --backend vita")
+    parser.add_argument("--backbone-path", type=Path, help="Converted CLIP backbone; required for vita/evl")
+    parser.add_argument("--evl-repo", type=Path, help="Official EVL repository; required for --backend evl")
+    parser.add_argument("--num-frames", type=int, default=8)
+    args = parser.parse_args(argv)
+    if args.backend == "vita":
+        if args.vita_repo is None or args.backbone_path is None:
+            parser.error("--vita-repo and --backbone-path are required with --backend vita")
+    elif args.backend == "evl" and (args.evl_repo is None or args.backbone_path is None):
+        parser.error("--evl-repo and --backbone-path are required with --backend evl")
+    if args.backend in {"vita", "evl"} and args.num_frames < 1:
+        parser.error("num-frames must be positive")
     if min(args.batch_size, args.epochs, args.logging_steps) < 1 or args.learning_rate <= 0:
         parser.error("batch size, epochs, logging steps and learning rate must be positive")
     if args.samples == 0 or args.samples < -1:
@@ -168,16 +182,25 @@ def main():
         parser.error("max_steps must be -1 or positive")
     if args.ucf101_root is not None and args.ucf101_splits is None:
         parser.error("--ucf101-splits is required with --ucf101-root")
+    return args
+
+
+def main():
+    args = parse_worker_args()
+    backend = args.backend
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # The parent restricts CUDA visibility before this interpreter imports torch.
     import torch
-    from transformers import AutoConfig, AutoProcessor, XCLIPModel, set_seed
 
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("Expected exactly one visible CUDA GPU; launch with run_vlm.py")
     torch.cuda.set_device(0)
-    set_seed(args.seed)
+    random.seed(args.seed)
+    import numpy as np
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
     if args.precision == "bf16" and not torch.cuda.is_bf16_supported():
         raise RuntimeError("bf16 unavailable; use --precision fp32")
     if args.ucf101_root is not None:
@@ -185,15 +208,34 @@ def main():
                                       args.ucf101_split, args.samples, args.seed)
     else:
         samples, classes = read_manifest(args.video_csv, args.samples)
-    config = AutoConfig.from_pretrained(args.model_id)
-    if config.model_type != "xclip":
-        raise ValueError(f"Video backend not implemented for model_type={config.model_type}; currently supports xclip")
-    processor = AutoProcessor.from_pretrained(args.model_id)
-    model = XCLIPModel.from_pretrained(args.model_id).to("cuda:0")
-    num_frames = config.vision_config.num_frames
-    prompts = [f"a video of {re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', label)}" for label in classes]
+    if backend == "vita":
+        from vita_backend import build_vita
+        model, processor = build_vita(args, classes)
+        num_frames = args.num_frames
+        training_mode = "frozen_backbone_multimodal_prompt_learning"
+    elif backend == "evl":
+        from evl_backend import build_evl
+        model, processor = build_evl(args, classes)
+        num_frames = args.num_frames
+        training_mode = "frozen_backbone_evl_decoder"
+    else:
+        from transformers import AutoConfig, AutoProcessor, XCLIPModel
+        config = AutoConfig.from_pretrained(args.model_id)
+        if config.model_type != "xclip":
+            raise ValueError(f"Video backend not implemented for model_type={config.model_type}; currently supports xclip")
+        processor = AutoProcessor.from_pretrained(args.model_id)
+        model = XCLIPModel.from_pretrained(args.model_id).to("cuda:0")
+        num_frames = config.vision_config.num_frames
+        training_mode = "full_parameter_class_prompt_cross_entropy"
+    class_names = [re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', label) for label in classes]
+    prompts = ([" ".join(["X"] * 8) + " " + label.replace("_", " ") + "." for label in class_names]
+               if backend == "vita" else [f"a video of {label}" for label in class_names])
+    if backend == "evl":
+        prompts = []
 
     def make_inputs(batch):
+        if backend in {"vita", "evl"}:
+            return {"pixel_values": processor([read_clip(path, num_frames) for path, _ in batch]).to("cuda:0")}
         inputs = processor(videos=[read_clip(path, num_frames) for path, _ in batch], text=prompts,
                            padding=True, truncation=True,
                            max_length=config.text_config.max_position_embeddings,
@@ -208,7 +250,9 @@ def main():
     write_json(args.output_dir / "effective_config.json", {
         "arguments": vars(args), "physical_gpu": physical_gpu,
         "gpu_uuid": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "backend": "xclip", "training_mode": "full_parameter_class_prompt_cross_entropy",
+        "backend": backend, "training_mode": training_mode,
+        "parameters": sum(p.numel() for p in model.parameters()),
+        "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "dataset": "UCF101" if args.ucf101_root is not None else "local_csv",
         "subset_policy": "all training rows" if args.samples == -1 else (
             "seeded random sample from official training split" if args.ucf101_root is not None else "first CSV rows"),
@@ -222,12 +266,13 @@ def main():
         # Fail visibly rather than continue training after a profiler may have modified hooks.
         try:
             profile_forward(model, make_inputs(samples[:args.batch_size]), args.output_dir,
-                            args.flops_log_path or args.output_dir / "flops_profile.txt", args.precision)
+                            args.flops_log_path or args.output_dir / "flops_profile.txt", args.precision,
+                            class_count=len(prompts))
         except Exception as exc:
             (args.output_dir / "forward_flops_error.txt").write_text(str(exc), encoding="utf-8")
             raise
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.learning_rate)
     steps_per_epoch = math.ceil(len(samples) / args.batch_size)
     target_steps = args.max_steps if args.max_steps > 0 else steps_per_epoch * args.epochs
     step = 0
@@ -281,7 +326,7 @@ def main():
         "training_seconds": elapsed,
         "peak_allocated_vram_gib": torch.cuda.max_memory_allocated(0) / 1024**3,
         "train_metrics": {"mean_step_loss": loss_sum / step},
-        "training_mode": "full_parameter_class_prompt_cross_entropy",
+        "training_mode": training_mode,
     })
     print(f"DONE: {args.output_dir.resolve()}", flush=True)
 
